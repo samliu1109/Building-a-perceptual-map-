@@ -1,0 +1,323 @@
+---
+title:  "Building Perceptual Map Using Amazon.com Review Data"
+Name: "Po Yi Liu"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#INSTALL AND IMPORT NECESSARY PACKAGES
+```{r, message=FALSE, warning=FALSE}
+library(jsonlite)
+library(R.utils)
+library(tidyverse)
+library(ggplot2)
+```
+
+#*********************************************************************************#
+# load data
+
+```{r, message=FALSE, warning=FALSE}
+setwd("D:/medium/perceptual map")
+review.df <- stream_in(file("Appliances.json.gz"))
+meta.df <- stream_in(file("meta_Appliances.json.gz"))
+```
+
+```{r}
+meta.df <- meta.df[,c("asin","brand","category")] 
+```
+
+
+#Merge datasets by ASIN 
+```{r, message=FALSE, warning=FALSE}
+data <- merge(meta.df, review.df, by="asin")
+```
+
+
+
+#*********************************************************************************#
+# OBTAIN THE LIST OF BRANDS TO BUILD PERCEPTUAL MAP
+
+#dropping observations without brand information, combining the same brands with various name variances, etc.
+#Note what's needed to do is dependent of the product category
+```{r, message=FALSE, warning=FALSE}
+data <- data%>%
+  filter(!is.na(brand))
+```
+
+
+
+#Find the top 20 brands in terms of total number of reviews
+```{r, message=FALSE, warning=FALSE}
+brands <- data%>%
+  filter(grepl('Range Parts & Accessories', category))%>%
+  select(brand) %>%
+  group_by(brand) %>%
+  count()%>%
+  arrange(desc(n))%>%
+  na.omit() %>%
+  ungroup() %>%
+  top_n(20, wt = n)
+
+top_20_brands <- brands$brand
+
+```
+
+
+#*********************************************************************************#
+# CONSTRUCT THE SIMILARITY MATRIX
+
+#Define function "computeLift"
+```{r, message=FALSE, warning=FALSE}
+computeLift <- function(data, brands){
+    
+  # Initialize a matrix to store the cooccurrence results
+  lift <- data.frame(matrix(NA, nrow=length(brands), ncol=length(brands)))
+  rownames(lift) <- brands
+  colnames(lift) <- brands
+  
+  # Initialize an array to store the occurrences, with the i th element being the occurrences of brand i
+  arr_occ <- c()
+  
+  # Initialize an array to store the co-occurrences, with the i*j th element being the co-occurrences of brand i and brand j
+  arr_coocc <- c()
+  
+  for (i in seq_along(brands)) {
+    
+    # In the outer loop, get the occurrences of brand i, and append it to the end of arr_occ
+    b1 <- brands[i]
+    # Detect the occurrences of b1 in review text
+    flag_1_rev <- str_detect(data$reviewText, b1)
+    # Detect whether the associated brand of the review is b1
+	  # We assume any nrand i reviews is a mention of the brand, even the brand name is not explicitly mentioned in review text.
+    flag_1_brand <- str_detect(data$brand, b1)
+    
+    # However, the str_detect function will return NA if the string is empty
+    # Set NAs in the `flag`, a boolean array, to False
+    flag_1_rev[is.na(flag_1_rev)] <- F
+    flag_1_brand[is.na(flag_1_brand)] <- F
+    
+    # Combine the two flags with 'OR' condition
+	  # As such, flag_1 flags all reviews that "mentions" brand i.
+    flag_1 <- flag_1_rev | flag_1_brand
+      
+    arr_occ <- c(arr_occ, sum(flag_1))
+    	
+    for (j in seq_along(brands)){
+      # In the inner loop, first get the occurrences of brand j.
+	  # Then get the co-occurrences of brand i and brand j, and append it to the end of arr_coocc
+	  
+	  # First, get the occurrences of brand j
+      b2 <- brands[j]
+      # Detect the occurrences of b2 in review text
+      flag_2_rev <- str_detect(data$reviewText, b2)
+      # Detect whether the review is under the product of b2
+      flag_2_brand <- str_detect(data$brand, b2)
+      
+      # However, the str_detect function will return NA if the string is empty
+      # Replace NA with FALSE
+      flag_2_rev[is.na(flag_2_rev)] <- F
+      flag_2_brand[is.na(flag_2_brand)] <- F
+      
+      # Combine the flags of b2 with 'OR' condition
+	  # As such, flag_2 flags all reviews that "mentions" brand j.
+      flag_2 <- flag_2_rev | flag_2_brand
+      
+      # get the index of co-occurrences of with "AND" condition
+      arr_coocc <- c(arr_coocc, sum(flag_2 & flag_1))
+      
+    }
+  }
+
+  # calculate lift #  
+  # Lift is a metric defined as the ratio of the actual co-occurrence of two terms to the frequency with which we would expect to see them together.
+  # The lift between terms A and B can be calculated as:
+  # Lift(A,B)= (P(A,B))/(P(A)×P(B))
+  # where P(X) is the probability of occurrence of term X in a given review, and P(X, Y) is the probability that both X and Y appear in a given review
+  
+  # loop over each cell of `lift` table by rows and columns 
+  # iterate over rows, indexed by i
+  for (i in 1:nrow(lift)){
+    # loop over columns, indexed by j
+    for (j in 1:ncol(lift)) {
+      # IF:
+      #  (1) the cell indexed is on the diagonal line, OR
+      #  (2) P(A) is zero, OR
+      #  (3) P(B) is zero
+      # THEN skip the loop because the denominator will be zero
+      if (i == j | arr_occ[i] == 0 | arr_occ[j] == 0) {
+        next
+      # Calculate lift with P(A, B)/(P(A)*P(B))
+      } else {
+		PAB <- arr_coocc[(i-1)*nrow(lift)+j]/nrow(data)
+		PA <- arr_occ[i]/nrow(data)
+		PB <- arr_occ[j]/nrow(data)
+        lift[i, j] = PAB / (PA * PB)
+      }
+      
+    }
+  }
+  return(lift)
+}
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+lift <- data.frame(matrix(NA, nrow=length(top_20_brands), ncol=length(top_20_brands)))
+  rownames(lift) <- top_20_brands
+  colnames(lift) <- top_20_brands
+  
+  # Initialize an array to store the occurrences, with the i th element being the occurrences of brand i
+  arr_occ <- c()
+  
+  # Initialize an array to store the co-occurrences, with the i*j th element being the co-occurrences of brand i and brand j
+  arr_coocc <- c()
+  
+for (i in seq_along(top_20_brands)) {
+    
+    # In the outer loop, get the occurrences of brand i, and append it to the end of arr_occ
+  b1 <- top_20_brands[i]
+    # Detect the occurrences of b1 in review text
+  flag_1_rev <- str_detect(data$reviewText, b1)
+    # Detect whether the associated brand of the review is b1
+	# We assume any nrand i reviews is a metion of the brand, even the brand name is not explicitly mentioned in review text.
+  flag_1_brand <- str_detect(data$brand, b1)
+    
+    # However, the str_detect function will return NA if the string is empty
+    # Set NAs in the `flag`, a boolean array, to False
+  flag_1_rev[is.na(flag_1_rev)] <- F
+  flag_1_brand[is.na(flag_1_brand)] <- F
+    
+    # Combine the two flags with 'OR' condition
+	# As such, flag_1 flags all reviews that "mentions" brand i.
+  flag_1 <- flag_1_rev | flag_1_brand
+      
+  arr_occ <- c(arr_occ, sum(flag_1))
+    	
+  for (j in seq_along(top_20_brands)){
+      # In the inner loop, first get the occurrences of brand j.
+	  # Then get the co-occurrences of brand i and brand j, and append it to the end of arr_coocc
+	  
+	  # First, get the occurrences of brand j
+    b2 <- top_20_brands[j]
+      # Detect the occurrences of b2 in review text
+    flag_2_rev <- str_detect(data$reviewText, b2)
+      # Detect whether the review is under the product of b2
+    flag_2_brand <- str_detect(data$brand, b2)
+      
+      # However, the str_detect function will return NA if the string is empty
+      # Replace NA with FALSE
+    flag_2_rev[is.na(flag_2_rev)] <- F
+    flag_2_brand[is.na(flag_2_brand)] <- F
+      
+      # Combine the flags of b2 with 'OR' condition
+	  # As such, flag_2 flags all reviews that "mentions" brand j.
+    flag_2 <- flag_2_rev | flag_2_brand
+      
+      # get the index of co-occurrences of with "AND" condition
+    arr_coocc <- c(arr_coocc, sum(flag_2 & flag_1))
+      
+  }
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+lift <- computeLift(data, top_20_brands)
+#write_csv(lift, "lift.csv") 
+
+```
+
+
+#*********************************************************************************#
+
+# CONVERT SIMILARITY MATRIX TO DISSIMILARITY MATRIX
+#Define function "convertSim"
+```{r, message=FALSE, warning=FALSE}
+convertSim <- function(SimilarityMatrix) {
+		
+	# Initialize the dissimilarity matrix
+	DissMat <- data.frame(matrix(NA, nrow=nrow(SimilarityMatrix), ncol=ncol(SimilarityMatrix)))
+
+	# Use a nested loop to iterate over the similarity matrix to change extremely small values to our lower bound
+	# we believe that the 0.00001 is small enough and the 9999999 is large enough to represent the ultimate dissimilarity
+	for (i in 1:nrow(SimilarityMatrix)) {
+		for (j in 1:ncol(SimilarityMatrix)) {
+			if(i == j){
+			# Assign zeros to the diagonal line--the dissimilarity of the pair of same brand is zero
+			DissMat[i, j] <- 0
+			next
+			} else if (is.na(SimilarityMatrix[i, j])){
+				# if the cell is NA, the pair of brands has never been mentioned together, so very dissimilar to each other.
+				# For this case, assign lower bound to SimilarityMatrix and 9999999 to DissMat
+				DissMat[i, j] <- 9999999
+				next
+			} else if (abs(SimilarityMatrix[i, j]) <= 0.00001) {
+				# if the cell is smaller than the lower bound, assign lower bound to it and 9999999 to DissMat
+				DissMat[i, j] <- 9999999
+				next
+			}
+		}
+	}
+
+	# Calculate dissimilarity of other cells
+	for (i in 1:nrow(SimilarityMatrix)) {
+	  for (j in 1:ncol(SimilarityMatrix)) {
+		if (is.na(DissMat[i, j])) {
+		  DissMat[i, j] <- round(1/SimilarityMatrix[i, j],4)
+		}
+	  }
+	}
+
+	# assign indexes to the dissimilarity matrix
+	rownames(DissMat) <- rownames(SimilarityMatrix)
+	colnames(DissMat) <- colnames(SimilarityMatrix)
+
+	return(DissMat)
+}
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+dissLift <- convertSim(lift)
+```
+
+
+#*********************************************************************************#
+
+# BUILD PERCEPTUAL MAP
+#Define function "mds_plot"
+```{r, message=FALSE, warning=FALSE}
+mds_plot <- function(DissimilarityMatrix, title = "MDS Perceptual Map Based on Amazon.com Review Data", 
+                     c1 = "Coordinate 1", c2 = "Coordinate 2") {
+					 
+	# get the 2-dimensional MDS scale
+  dissLift.mat <- data.matrix(dissLift)
+	DissMatrix.mds <- cmdscale(dissLift.mat, eig=TRUE, k=2)
+	
+	# DissMatrix.mds is a list
+	result <- data.frame(DissMatrix.mds$points)
+	colnames(result) = c("Coordinate1", "Coordinate2")
+	
+	# Plot solution
+	p <- ggplot(data = result, aes(x= Coordinate1, y = Coordinate2)) +
+	  geom_text(label = rownames(result)) +
+	  ggtitle(title) +
+	  labs(x = c1, y = c2)
+
+	return(list("mds_plot" = p, "DissLift" = DissimilarityMatrix))
+}
+
+```
+
+
+# get the MDS plot using the self-defined function
+```{r, message=FALSE, warning=FALSE}
+mds <- mds_plot(dissLift)
+mds$mds_plot
+```
+
+
